@@ -65,6 +65,7 @@ SESSION_HISTORY_LIMIT = 15
 SESSION_ACTIVE_LIFETIME = 1.2
 
 sessions_lock = Lock()
+processing_lock = Lock()
 sessions: Dict[str, Dict[str, object]] = {}
 
 
@@ -107,10 +108,31 @@ def angle_between(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     return math.degrees(math.acos(cosine))
 
 
-def is_finger_extended(landmarks: List[np.ndarray], finger: str) -> bool:
+def finger_extension_score(landmarks: List[np.ndarray], finger: str) -> float:
     mcp, pip, dip, tip = finger_indices[finger]
     angle = angle_between(landmarks[mcp], landmarks[pip], landmarks[tip])
-    return angle > 160
+
+    wrist = landmarks[0]
+    palm_reference = (
+        vector_length(vector(wrist, landmarks[9]))
+        + vector_length(vector(wrist, landmarks[13]))
+    )
+    if palm_reference <= 1e-5:
+        palm_reference = 1.0
+
+    tip_distance = vector_length(vector(wrist, landmarks[tip]))
+    pip_distance = vector_length(vector(wrist, landmarks[pip]))
+
+    length_ratio = (tip_distance - pip_distance * 0.35) / palm_reference
+    length_ratio = float(np.clip(length_ratio, 0.0, 1.2))
+
+    angle_score = np.clip((angle - 110.0) / 70.0, 0.0, 1.0)
+    combined = 0.55 * angle_score + 0.45 * min(1.0, length_ratio)
+    return float(np.clip(combined, 0.0, 1.0))
+
+
+def is_finger_extended(landmarks: List[np.ndarray], finger: str) -> bool:
+    return finger_extension_score(landmarks, finger) > 0.62
 
 
 def thumb_orientation(landmarks: List[np.ndarray], handedness: str) -> Dict[str, float]:
@@ -129,7 +151,20 @@ def finger_spread(landmarks: List[np.ndarray]) -> float:
     for i in range(len(tips) - 1):
         for j in range(i + 1, len(tips)):
             distances.append(vector_length(vector(tips[i], tips[j])))
-    return float(np.mean(distances)) if distances else 0.0
+
+    wrist = landmarks[0]
+    reference = vector_length(vector(wrist, landmarks[9])) + vector_length(vector(wrist, landmarks[13]))
+    if reference <= 1e-5:
+        reference = 1.0
+    mean_distance = float(np.mean(distances)) if distances else 0.0
+    return mean_distance / reference
+
+
+def palm_facing_camera_score(landmarks: List[np.ndarray]) -> float:
+    wrist = landmarks[0]
+    tips = [landmarks[i] for i in (8, 12, 16, 20)]
+    average_tip_depth = float(np.mean([tip[2] for tip in tips]))
+    return wrist[2] - average_tip_depth
 
 
 def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
@@ -146,17 +181,22 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         landmarks = [np.array([lm.x, lm.y, lm.z if lm.z is not None else 0.0], dtype=np.float32)
                      for lm in hand_landmarks.landmark]
 
-        extended = {finger: is_finger_extended(landmarks, finger) for finger in finger_indices}
+        extension_scores = {finger: finger_extension_score(landmarks, finger) for finger in finger_indices}
+        extended = {finger: score > 0.62 for finger, score in extension_scores.items()}
         spread = finger_spread(landmarks)
         orientation = thumb_orientation(landmarks, handedness)
+        palm_facing_score = palm_facing_camera_score(landmarks)
 
         total_extended = sum(1 for value in extended.values() if value)
-        clenched_score = 1 - total_extended / 5.0
+        average_extension = float(np.mean(list(extension_scores.values())))
+        clenched_score = max(0.0, 1.0 - average_extension)
 
-        if total_extended == 5 and spread > 0.19:
-            confidence = min(1.0, 0.6 + spread)
+        hand_candidates: List[Dict[str, object]] = []
+
+        if total_extended == 5 and spread > 0.32 and palm_facing_score > 0.015:
+            confidence = min(1.0, 0.55 + spread * 0.85 + palm_facing_score * 5)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"airplane-{index}",
                     "label": "Airplane Gesture",
                     "emoji": gesture_emojis["airplane"],
@@ -164,10 +204,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "type": "gesture",
                     "description": "Palm open with fingers stretched wide like airplane wings.",
                 })
-        elif total_extended == 5:
-            confidence = min(1.0, 0.45 + spread * 2)
+        elif total_extended >= 4 and spread > 0.18:
+            confidence = min(1.0, 0.45 + spread * 1.4 + palm_facing_score * 4)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"open-{index}",
                     "label": "Open Palm",
                     "emoji": gesture_emojis["open"],
@@ -176,10 +216,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "description": "All fingers extended with relaxed spacing.",
                 })
 
-        if clenched_score > 0.7:
-            confidence = min(1.0, clenched_score + 0.2)
+        if clenched_score > 0.58:
+            confidence = min(1.0, 0.5 + clenched_score * 0.9)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"fist-{index}",
                     "label": "Closed Fist",
                     "emoji": gesture_emojis["fist"],
@@ -190,9 +230,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
 
         if extended["thumb"] and not any(extended[f] for f in ("index", "middle", "ring", "pinky")):
             vertical = -orientation["vertical"]
-            confidence = min(1.0, 0.6 + max(0.0, vertical) * 2)
+            sideways = abs(orientation["direction"])
+            confidence = min(1.0, 0.55 + max(0.0, vertical) * 2.4 - sideways * 0.8)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"thumbsup-{index}",
                     "label": "Thumbs Up",
                     "emoji": gesture_emojis["thumbsup"],
@@ -202,9 +243,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                 })
 
         if extended["index"] and extended["middle"] and not extended["ring"] and not extended["pinky"]:
-            confidence = min(1.0, 0.55 + spread * 1.5)
+            separation = distance_between(landmarks, 8, 12) / max(spread, 1e-5)
+            confidence = min(1.0, 0.5 + spread * 1.3 + separation * 0.1)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"peace-{index}",
                     "label": "Peace Sign",
                     "emoji": gesture_emojis["peace"],
@@ -214,9 +256,11 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                 })
 
         if extended["index"] and extended["pinky"] and extended["thumb"] and not extended["middle"] and not extended["ring"]:
-            confidence = min(1.0, 0.55 + spread * 1.25)
+            curl_balance = (extension_scores["thumb"] + extension_scores["index"] + extension_scores["pinky"]) / 3.0
+            curl_penalty = (extension_scores["middle"] + extension_scores["ring"]) / 2.0
+            confidence = min(1.0, 0.5 + spread * 1.1 + curl_balance * 0.4 - curl_penalty * 0.6)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"love-{index}",
                     "label": "Love You Sign",
                     "emoji": gesture_emojis["love"],
@@ -224,6 +268,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "type": "gesture",
                     "description": "Thumb, index, and pinky extended with middle and ring fingers folded.",
                 })
+
+        if hand_candidates:
+            best_candidate = max(hand_candidates, key=lambda item: item.get("confidence", 0.0))
+            detections.append(best_candidate)
 
     return detections
 
@@ -281,10 +329,13 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
 
     brow_comp = eyebrow_compression(landmarks)
 
-    if smile_ratio > 0.42:
-        confidence = min(1.0, (smile_ratio - 0.42) * 3 + 0.5)
+    face_candidates: List[Dict[str, object]] = []
+
+    if smile_ratio > 0.4 and mouth_open < 0.32:
+        smile_tightness = max(0.0, 0.48 - mouth_open)
+        confidence = min(1.0, (smile_ratio - 0.4) * 3.2 + smile_tightness)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "smile",
                 "label": "Bright Smile",
                 "emoji": expression_emojis["smile"],
@@ -293,10 +344,11 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "description": "Mouth corners widened — classic happy smile.",
             })
 
-    if surprise_ratio > 0.32 and mouth_open > 0.24:
-        confidence = min(1.0, (surprise_ratio - 0.32) * 4 + 0.5)
+    if surprise_ratio > 0.3 and mouth_open > 0.26:
+        lip_roundness = surprise_ratio * 0.6 + mouth_open * 0.4
+        confidence = min(1.0, (lip_roundness - 0.26) * 4.5 + 0.45)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "surprised",
                 "label": "Surprised",
                 "emoji": expression_emojis["surprised"],
@@ -305,10 +357,10 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "description": "Mouth open with rounded lips indicating surprise.",
             })
 
-    if mouth_open > 0.28 and tongue_visibility > 0.008:
-        confidence = min(1.0, 0.6 + tongue_visibility * 60)
+    if mouth_open > 0.3 and tongue_visibility > 0.01:
+        confidence = min(1.0, 0.55 + tongue_visibility * 55)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "tongue",
                 "label": "Tongue Out",
                 "emoji": expression_emojis["tongue"],
@@ -317,10 +369,10 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "description": "Tongue visible with playful expression.",
             })
 
-    if brow_comp > 0.04 and mouth_open < 0.2:
-        confidence = min(1.0, 0.5 + brow_comp * 8)
+    if brow_comp > 0.04 and mouth_open < 0.22:
+        confidence = min(1.0, 0.48 + brow_comp * 8.5)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "angry",
                 "label": "Angry",
                 "emoji": expression_emojis["angry"],
@@ -329,11 +381,12 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "description": "Brows drawn together signaling anger or focus.",
             })
 
-    if abs(left_eye - right_eye) > 0.08:
+    eye_asymmetry = abs(left_eye - right_eye)
+    if eye_asymmetry > 0.09:
         winking_eye_open = min(left_eye, right_eye)
-        confidence = min(1.0, 0.55 + (0.22 - winking_eye_open) * 4)
+        confidence = min(1.0, 0.52 + eye_asymmetry * 2.5 + max(0.0, 0.2 - winking_eye_open) * 3)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "wink",
                 "label": "Playful Wink",
                 "emoji": expression_emojis["wink"],
@@ -341,6 +394,10 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "type": "expression",
                 "description": "One eye relaxed while the other remains open.",
             })
+
+    if face_candidates:
+        best_candidate = max(face_candidates, key=lambda item: item.get("confidence", 0.0))
+        detections.append(best_candidate)
 
     return detections
 
@@ -426,8 +483,9 @@ async def detect(payload: DetectionRequest):
 
     start = time.perf_counter()
 
-    hand_results = hands_solution.process(frame)
-    face_results = face_mesh_solution.process(frame)
+    with processing_lock:
+        hand_results = hands_solution.process(frame)
+        face_results = face_mesh_solution.process(frame)
 
     threshold = session.get("sensitivity", sensitivity)
     hand_detections = analyze_hands(hand_results, threshold)
