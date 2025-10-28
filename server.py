@@ -191,10 +191,12 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         average_extension = float(np.mean(list(extension_scores.values())))
         clenched_score = max(0.0, 1.0 - average_extension)
 
+        hand_candidates: List[Dict[str, object]] = []
+
         if total_extended == 5 and spread > 0.32 and palm_facing_score > 0.015:
             confidence = min(1.0, 0.55 + spread * 0.85 + palm_facing_score * 5)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"airplane-{index}",
                     "label": "Airplane Gesture",
                     "emoji": gesture_emojis["airplane"],
@@ -205,7 +207,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         elif total_extended >= 4 and spread > 0.18:
             confidence = min(1.0, 0.45 + spread * 1.4 + palm_facing_score * 4)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"open-{index}",
                     "label": "Open Palm",
                     "emoji": gesture_emojis["open"],
@@ -217,7 +219,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         if clenched_score > 0.58:
             confidence = min(1.0, 0.5 + clenched_score * 0.9)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"fist-{index}",
                     "label": "Closed Fist",
                     "emoji": gesture_emojis["fist"],
@@ -231,7 +233,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
             sideways = abs(orientation["direction"])
             confidence = min(1.0, 0.55 + max(0.0, vertical) * 2.4 - sideways * 0.8)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"thumbsup-{index}",
                     "label": "Thumbs Up",
                     "emoji": gesture_emojis["thumbsup"],
@@ -244,7 +246,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
             separation = distance_between(landmarks, 8, 12) / max(spread, 1e-5)
             confidence = min(1.0, 0.5 + spread * 1.3 + separation * 0.1)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"peace-{index}",
                     "label": "Peace Sign",
                     "emoji": gesture_emojis["peace"],
@@ -258,7 +260,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
             curl_penalty = (extension_scores["middle"] + extension_scores["ring"]) / 2.0
             confidence = min(1.0, 0.5 + spread * 1.1 + curl_balance * 0.4 - curl_penalty * 0.6)
             if confidence >= threshold:
-                detections.append({
+                hand_candidates.append({
                     "id": f"love-{index}",
                     "label": "Love You Sign",
                     "emoji": gesture_emojis["love"],
@@ -266,6 +268,10 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "type": "gesture",
                     "description": "Thumb, index, and pinky extended with middle and ring fingers folded.",
                 })
+
+        if hand_candidates:
+            best_candidate = max(hand_candidates, key=lambda item: item.get("confidence", 0.0))
+            detections.append(best_candidate)
 
     return detections
 
@@ -323,11 +329,13 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
 
     brow_comp = eyebrow_compression(landmarks)
 
+    face_candidates: List[Dict[str, object]] = []
+
     if smile_ratio > 0.4 and mouth_open < 0.32:
         smile_tightness = max(0.0, 0.48 - mouth_open)
         confidence = min(1.0, (smile_ratio - 0.4) * 3.2 + smile_tightness)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "smile",
                 "label": "Bright Smile",
                 "emoji": expression_emojis["smile"],
@@ -340,7 +348,7 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
         lip_roundness = surprise_ratio * 0.6 + mouth_open * 0.4
         confidence = min(1.0, (lip_roundness - 0.26) * 4.5 + 0.45)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "surprised",
                 "label": "Surprised",
                 "emoji": expression_emojis["surprised"],
@@ -352,7 +360,7 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
     if mouth_open > 0.3 and tongue_visibility > 0.01:
         confidence = min(1.0, 0.55 + tongue_visibility * 55)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "tongue",
                 "label": "Tongue Out",
                 "emoji": expression_emojis["tongue"],
@@ -364,7 +372,7 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
     if brow_comp > 0.04 and mouth_open < 0.22:
         confidence = min(1.0, 0.48 + brow_comp * 8.5)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "angry",
                 "label": "Angry",
                 "emoji": expression_emojis["angry"],
@@ -378,7 +386,7 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
         winking_eye_open = min(left_eye, right_eye)
         confidence = min(1.0, 0.52 + eye_asymmetry * 2.5 + max(0.0, 0.2 - winking_eye_open) * 3)
         if confidence >= threshold:
-            detections.append({
+            face_candidates.append({
                 "id": "wink",
                 "label": "Playful Wink",
                 "emoji": expression_emojis["wink"],
@@ -386,6 +394,10 @@ def analyze_face(results, threshold: float) -> List[Dict[str, object]]:
                 "type": "expression",
                 "description": "One eye relaxed while the other remains open.",
             })
+
+    if face_candidates:
+        best_candidate = max(face_candidates, key=lambda item: item.get("confidence", 0.0))
+        detections.append(best_candidate)
 
     return detections
 
