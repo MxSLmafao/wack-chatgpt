@@ -65,6 +65,7 @@ SESSION_HISTORY_LIMIT = 15
 SESSION_ACTIVE_LIFETIME = 1.2
 
 sessions_lock = Lock()
+processing_lock = Lock()
 sessions: Dict[str, Dict[str, object]] = {}
 
 
@@ -470,8 +471,9 @@ async def detect(payload: DetectionRequest):
 
     start = time.perf_counter()
 
-    hand_results = hands_solution.process(frame)
-    face_results = face_mesh_solution.process(frame)
+    with processing_lock:
+        hand_results = hands_solution.process(frame)
+        face_results = face_mesh_solution.process(frame)
 
     threshold = session.get("sensitivity", sensitivity)
     hand_detections = analyze_hands(hand_results, threshold)
