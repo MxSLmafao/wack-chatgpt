@@ -193,8 +193,16 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
 
         hand_candidates: List[Dict[str, object]] = []
 
-        if total_extended == 5 and spread > 0.32 and palm_facing_score > 0.015:
-            confidence = min(1.0, 0.55 + spread * 0.85 + palm_facing_score * 5)
+        # Airplane gesture
+        airplane_wings = extended["thumb"] and extended["middle"] and extended["pinky"]
+        airplane_folded = (extension_scores["index"] < 0.45) and (extension_scores["ring"] < 0.45)
+        if airplane_wings and airplane_folded:
+            wing_span = (extension_scores["thumb"] + extension_scores["middle"] + extension_scores["pinky"]) / 3.0
+            fold_suppression = 1.0 - ((extension_scores["index"] + extension_scores["ring"]) / 2.0)
+            confidence = min(
+                1.0,
+                0.4 + wing_span * 0.45 + max(0.0, spread - 0.12) * 1.1 + fold_suppression * 0.35,
+            )
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"airplane-{index}",
@@ -202,8 +210,9 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "emoji": gesture_emojis["airplane"],
                     "confidence": confidence,
                     "type": "gesture",
-                    "description": "Palm open with fingers stretched wide like airplane wings.",
+                    "description": "Thumb, middle, and pinky extended while index and ring fold like airplane wings.",
                 })
+
         elif total_extended >= 4 and spread > 0.18:
             confidence = min(1.0, 0.45 + spread * 1.4 + palm_facing_score * 4)
             if confidence >= threshold:
