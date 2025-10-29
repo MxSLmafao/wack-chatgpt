@@ -98,6 +98,13 @@ def vector_length(vec: np.ndarray) -> float:
     return float(np.linalg.norm(vec))
 
 
+def normalize(vec: np.ndarray) -> np.ndarray:
+    length = np.linalg.norm(vec)
+    if length <= 1e-6:
+        return np.zeros_like(vec)
+    return vec / length
+
+
 def angle_between(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     ab = vector(b, a)
     cb = vector(b, c)
@@ -160,11 +167,28 @@ def finger_spread(landmarks: List[np.ndarray]) -> float:
     return mean_distance / reference
 
 
+def palm_normal(landmarks: List[np.ndarray]) -> np.ndarray:
+    wrist = landmarks[0]
+    index_base = landmarks[5]
+    pinky_base = landmarks[17]
+    normal = np.cross(vector(wrist, index_base), vector(wrist, pinky_base))
+    return normalize(normal)
+
+
+def finger_direction(landmarks: List[np.ndarray], finger: str) -> np.ndarray:
+    mcp, _, _, tip = finger_indices[finger]
+    return normalize(vector(landmarks[mcp], landmarks[tip]))
+
+
 def palm_facing_camera_score(landmarks: List[np.ndarray]) -> float:
     wrist = landmarks[0]
     tips = [landmarks[i] for i in (8, 12, 16, 20)]
     average_tip_depth = float(np.mean([tip[2] for tip in tips]))
     return wrist[2] - average_tip_depth
+
+
+def distance_between(landmarks: List[np.ndarray], a: int, b: int) -> float:
+    return vector_length(vector(landmarks[a], landmarks[b]))
 
 
 def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
@@ -186,6 +210,9 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         spread = finger_spread(landmarks)
         orientation = thumb_orientation(landmarks, handedness)
         palm_facing_score = palm_facing_camera_score(landmarks)
+        normal = palm_normal(landmarks)
+        forward_facing = max(0.0, -normal[2])
+        sideways_bias = abs(normal[0])
 
         total_extended = sum(1 for value in extended.values() if value)
         average_extension = float(np.mean(list(extension_scores.values())))
@@ -193,15 +220,24 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
 
         hand_candidates: List[Dict[str, object]] = []
 
-        # Airplane gesture
         airplane_wings = extended["thumb"] and extended["middle"] and extended["pinky"]
         airplane_folded = (extension_scores["index"] < 0.45) and (extension_scores["ring"] < 0.45)
         if airplane_wings and airplane_folded:
+            middle_direction = finger_direction(landmarks, "middle")
+            pinky_direction = finger_direction(landmarks, "pinky")
+            wing_angle = math.degrees(math.acos(np.clip(np.dot(middle_direction, pinky_direction), -1.0, 1.0)))
             wing_span = (extension_scores["thumb"] + extension_scores["middle"] + extension_scores["pinky"]) / 3.0
             fold_suppression = 1.0 - ((extension_scores["index"] + extension_scores["ring"]) / 2.0)
+            wing_balance = np.clip((wing_angle - 15.0) / 45.0, 0.0, 1.0)
+            forward_bonus = min(1.0, forward_facing * 1.4 + max(0.0, 0.25 - sideways_bias) * 1.1)
             confidence = min(
                 1.0,
-                0.4 + wing_span * 0.45 + max(0.0, spread - 0.12) * 1.1 + fold_suppression * 0.35,
+                0.35
+                + wing_span * 0.35
+                + max(0.0, spread - 0.1) * 0.9
+                + fold_suppression * 0.3
+                + wing_balance * 0.25
+                + forward_bonus * 0.2,
             )
             if confidence >= threshold:
                 hand_candidates.append({
@@ -213,8 +249,13 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "description": "Thumb, middle, and pinky extended while index and ring fold like airplane wings.",
                 })
 
-        elif total_extended >= 4 and spread > 0.18:
-            confidence = min(1.0, 0.45 + spread * 1.4 + palm_facing_score * 4)
+        elif total_extended >= 4 and spread > 0.16:
+            finger_alignment = np.mean([
+                max(0.0, np.dot(finger_direction(landmarks, finger), np.array([0.0, -1.0, 0.0])))
+                for finger in ("index", "middle", "ring", "pinky")
+            ])
+            facing_bonus = min(1.0, forward_facing * 1.3 + max(0.0, palm_facing_score) * 3)
+            confidence = min(1.0, 0.4 + spread * 1.1 + finger_alignment * 0.5 + facing_bonus * 0.4)
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"open-{index}",
@@ -225,8 +266,9 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "description": "All fingers extended with relaxed spacing.",
                 })
 
-        if clenched_score > 0.58:
-            confidence = min(1.0, 0.5 + clenched_score * 0.9)
+        if clenched_score > 0.55 and spread < 0.15:
+            knuckle_compactness = max(0.0, 0.22 - spread) * 3.2
+            confidence = min(1.0, 0.48 + clenched_score * 0.85 + knuckle_compactness)
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"fist-{index}",
@@ -240,7 +282,9 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         if extended["thumb"] and not any(extended[f] for f in ("index", "middle", "ring", "pinky")):
             vertical = -orientation["vertical"]
             sideways = abs(orientation["direction"])
-            confidence = min(1.0, 0.55 + max(0.0, vertical) * 2.4 - sideways * 0.8)
+            sideways_penalty = max(0.0, sideways - 0.05) * 2.2
+            forward_penalty = max(0.0, 0.15 - forward_facing) * 1.4
+            confidence = min(1.0, 0.52 + max(0.0, vertical) * 2.3 - sideways_penalty - forward_penalty)
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"thumbsup-{index}",
@@ -252,8 +296,12 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                 })
 
         if extended["index"] and extended["middle"] and not extended["ring"] and not extended["pinky"]:
+            index_direction = finger_direction(landmarks, "index")
+            middle_direction = finger_direction(landmarks, "middle")
+            v_angle = math.degrees(math.acos(np.clip(np.dot(index_direction, middle_direction), -1.0, 1.0)))
             separation = distance_between(landmarks, 8, 12) / max(spread, 1e-5)
-            confidence = min(1.0, 0.5 + spread * 1.3 + separation * 0.1)
+            v_quality = np.clip((v_angle - 10.0) / 40.0, 0.0, 1.0)
+            confidence = min(1.0, 0.48 + spread * 1.0 + separation * 0.08 + v_quality * 0.6)
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"peace-{index}",
@@ -267,7 +315,8 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
         if extended["index"] and extended["pinky"] and extended["thumb"] and not extended["middle"] and not extended["ring"]:
             curl_balance = (extension_scores["thumb"] + extension_scores["index"] + extension_scores["pinky"]) / 3.0
             curl_penalty = (extension_scores["middle"] + extension_scores["ring"]) / 2.0
-            confidence = min(1.0, 0.5 + spread * 1.1 + curl_balance * 0.4 - curl_penalty * 0.6)
+            hook_span = distance_between(landmarks, 8, 20) / max(spread + 1e-5, 1e-5)
+            confidence = min(1.0, 0.48 + spread * 0.9 + curl_balance * 0.45 - curl_penalty * 0.65 + min(1.0, hook_span * 0.05))
             if confidence >= threshold:
                 hand_candidates.append({
                     "id": f"love-{index}",
@@ -285,12 +334,23 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
     return detections
 
 
-def distance_between(landmarks: List[np.ndarray], a: int, b: int) -> float:
-    return vector_length(vector(landmarks[a], landmarks[b]))
-
-
 def average(values: List[float]) -> float:
     return float(np.mean(values)) if values else 0.0
+
+
+def detection_slot(detection_id: str) -> Optional[str]:
+    """Return a slot identifier for mutually exclusive detections.
+
+    Gesture detections encode the tracked hand index in their identifier
+    (e.g. ``airplane-0``). When we promote a new detection for that hand we
+    should retire any lingering entries associated with the same slot so the
+    session state cannot hold conflicting gestures for the same limb.
+    """
+
+    parts = detection_id.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[1]
+    return None
 
 
 def eye_openness(landmarks: List[np.ndarray], vertical_pair, horizontal_pair) -> float:
@@ -436,6 +496,17 @@ def update_session_state(session: Dict[str, object], detections: List[Dict[str, 
     for detection in detections:
         detection_with_time = detection.copy()
         detection_with_time["timestamp"] = now
+
+        slot = detection_slot(detection["id"])
+        if slot is not None:
+            conflicting_ids = [
+                key
+                for key in list(active.keys())
+                if key != detection["id"] and detection_slot(key) == slot
+            ]
+            for key in conflicting_ids:
+                active.pop(key, None)
+
         active[detection["id"]] = detection_with_time
 
     expired = [key for key, value in active.items() if now - value["timestamp"] > SESSION_ACTIVE_LIFETIME]
