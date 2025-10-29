@@ -187,6 +187,10 @@ def palm_facing_camera_score(landmarks: List[np.ndarray]) -> float:
     return wrist[2] - average_tip_depth
 
 
+def distance_between(landmarks: List[np.ndarray], a: int, b: int) -> float:
+    return vector_length(vector(landmarks[a], landmarks[b]))
+
+
 def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
     detections: List[Dict[str, object]] = []
     if not results or not results.multi_hand_landmarks:
@@ -327,10 +331,6 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
             detections.append(best_candidate)
 
     return detections
-
-
-def distance_between(landmarks: List[np.ndarray], a: int, b: int) -> float:
-    return vector_length(vector(landmarks[a], landmarks[b]))
 
 
 def average(values: List[float]) -> float:
