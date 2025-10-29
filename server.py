@@ -337,6 +337,21 @@ def average(values: List[float]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+def detection_slot(detection_id: str) -> Optional[str]:
+    """Return a slot identifier for mutually exclusive detections.
+
+    Gesture detections encode the tracked hand index in their identifier
+    (e.g. ``airplane-0``). When we promote a new detection for that hand we
+    should retire any lingering entries associated with the same slot so the
+    session state cannot hold conflicting gestures for the same limb.
+    """
+
+    parts = detection_id.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[1]
+    return None
+
+
 def eye_openness(landmarks: List[np.ndarray], vertical_pair, horizontal_pair) -> float:
     vertical = distance_between(landmarks, vertical_pair[0], vertical_pair[1])
     horizontal = distance_between(landmarks, horizontal_pair[0], horizontal_pair[1])
@@ -480,6 +495,17 @@ def update_session_state(session: Dict[str, object], detections: List[Dict[str, 
     for detection in detections:
         detection_with_time = detection.copy()
         detection_with_time["timestamp"] = now
+
+        slot = detection_slot(detection["id"])
+        if slot is not None:
+            conflicting_ids = [
+                key
+                for key in list(active.keys())
+                if key != detection["id"] and detection_slot(key) == slot
+            ]
+            for key in conflicting_ids:
+                active.pop(key, None)
+
         active[detection["id"]] = detection_with_time
 
     expired = [key for key, value in active.items() if now - value["timestamp"] > SESSION_ACTIVE_LIFETIME]
