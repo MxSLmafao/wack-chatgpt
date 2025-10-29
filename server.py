@@ -248,6 +248,7 @@ def analyze_hands(results, threshold: float) -> List[Dict[str, object]]:
                     "type": "gesture",
                     "description": "Thumb, middle, and pinky extended while index and ring fold like airplane wings.",
                 })
+
         elif total_extended >= 4 and spread > 0.16:
             finger_alignment = np.mean([
                 max(0.0, np.dot(finger_direction(landmarks, finger), np.array([0.0, -1.0, 0.0])))
